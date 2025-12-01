@@ -16,11 +16,11 @@ from typing import Iterable, List
 
 
 # Base command to run (Hydra overrides will be appended)
-BASE_CMD = "dora run"
+BASE_CMD = "dora run train.grid_mode=True"
 
 # Hyperparameter grid: keys are Hydra override strings, values are lists to sweep.
 GRID = {
-    "train.group_random_pct": [0.2, 0.5, 0.7]
+    "sae.expansion": [1.0, 2.0, 5.0, 10.0]
 }
 
 

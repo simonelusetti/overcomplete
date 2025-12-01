@@ -60,7 +60,7 @@ def build_dataset(
     ds = encode_examples(ds, tok, encoder, text_fn, max_length, keep_labels)
     return ds, tok
 
-def initialize_dataloaders(cfg, logger):
+def initialize_dataloaders(cfg, log=True):
     train_cfg = cfg.data.train
     eval_cfg = cfg.data.eval
     dev_cfg = cfg.data.dev
@@ -73,6 +73,7 @@ def initialize_dataloaders(cfg, logger):
         shuffle=train_cfg.shuffle,
         dataset_config=train_cfg.config,
         cnn_field=train_cnn_field,
+        log=log,
     )
 
     eval_split = eval_cfg.split if hasattr(eval_cfg, "split") else "validation"
@@ -85,6 +86,7 @@ def initialize_dataloaders(cfg, logger):
         shuffle=bool(eval_cfg.shuffle),
         dataset_config=eval_cfg.config,
         cnn_field=eval_cnn_field,
+        log=log,
     )
 
     dev_dl = None
@@ -99,6 +101,7 @@ def initialize_dataloaders(cfg, logger):
             shuffle=bool(dev_cfg.shuffle),
             dataset_config=dev_cfg.config,
             cnn_field=dev_cnn_field,
+            log=log,
         )
         dev_dl = DataLoader(
             dev_ds,
@@ -186,7 +189,8 @@ def collate(batch):
 
 def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
                 name="cnn", split="train", dataset_config=None,
-                cnn_field=None, subset=None, rebuild=False, shuffle=False):
+                cnn_field=None, subset=None, rebuild=False, shuffle=False, 
+                log=True):
     dataset_config = normalize_dataset_config(name, dataset_config)
 
     filename = dataset_cache_filename(
@@ -216,11 +220,12 @@ def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
             )
             fallback_path = Path(to_absolute_path(f"./data/{fallback_filename}"))
             if fallback_path.exists():
-                logger.warning(
-                    "Subset cache %s not found; using full cache %s and selecting a subset in-memory.",
-                    path,
-                    fallback_path,
-                )
+                if log:
+                    logger.warning(
+                        "Subset cache %s not found; using full cache %s and selecting a subset in-memory.",
+                        path,
+                        fallback_path,
+                    )
                 path = fallback_path
                 apply_subset_after_load = True
             else:
@@ -233,7 +238,8 @@ def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
                 f"Dataset cache {path} not found. Run `../tools/datasets/build_dataset.py --dataset {name} --splits {split}` to materialise it."
             )
 
-    logger.info(f"Loading cached dataset from {path}")
+    if log:
+        logger.info(f"Loading cached dataset from {path}")
     try:
         ds = load_from_disk(path)
     except (FileNotFoundError, ValueError) as err:
@@ -246,7 +252,8 @@ def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
         if target_subset <= 1.0:
             target_subset = int(len(ds) * target_subset)
         ds = ds.select(range(target_subset))
-        logger.info("Materialised subset of %s examples from %s in-memory.", target_subset, path)
+        if log:
+            logger.info("Materialised subset of %s examples from %s in-memory.", target_subset, path)
 
     if shuffle:
         ds = ds.shuffle(seed=42)

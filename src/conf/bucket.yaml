@@ -1,24 +1,30 @@
 defaults:
   - _self_
 
-sae:
-  expansion: 1.0          # d_hidden = expansion * d_model
-  alpha: 8.6e-4           # sparsity weight on codes
+bucket_model:
+  num_buckets: 2
+  temperature: 1.0
+  sbert_model: "sentence-transformers/all-MiniLM-L6-v2"
+  prototype_ema_decay: 0.5
+  prototype_margin: 0.3
+  prototype_eps: 1e-6
+  entropy_weight: 1.0
+  balance_weight: 1.0
+  prototype_pull_weight: 1.0
+  prototype_repulsion_weight: 1.0
   lr: 1e-3
   weight_decay: 0.0
   grad_clip: 1.0
-  max_tokens_per_batch: null  # downsample tokens per step for memory; set null to disable
+  tree_depth: 1
+  d_model: null  # set at runtime from dataset
 
 train:
   eval_only: False
-  grid_mode: False
-  epochs: 30
+  eval_epoch: True
+  epochs: [5,5,5]
+  validate_every: 1
   log_interval: 50
-  checkpoint: "sparse_autoencoder.pth"
-
-entity_eval:
-  threshold: 0.3           # activation threshold for entity prediction on the chosen dimension
-  run_after_epoch: True
+  checkpoint: "bucket_model.pth"
 
 data:
   rebuild_ds: False
@@ -38,8 +44,8 @@ data:
     subset: 1.0
     shuffle: False
   dev:
-    dataset: "wikiann"
-    config: "en"
+    dataset: null
+    config: null
     split: "test"
     batch_size: 16
     num_workers: 0
@@ -53,7 +59,7 @@ runtime:
 array: 0
 
 dora:
-  exclude: ["eval.*", "data.rebuild_ds", "logging.*", "train.eval_only", "train.grid_mode"]
+  exclude: ["eval.*", "data.rebuild_ds", "logging.*"]
 
 slurm:
   partition: "boost_usr_prod"

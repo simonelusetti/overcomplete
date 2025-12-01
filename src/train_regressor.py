@@ -173,73 +173,119 @@ class SparseAETrainer:
         )
 
     def _select_entity_dimension(self, loader) -> Optional[int]:
+        """
+        Pure PyTorch implementation of a sparse (L1) logistic regression probe
+        to identify which SAE dictionary dimension best predicts entityness.
+        """
         if self.model is None:
             raise RuntimeError("Model is not initialized.")
         self.model.eval()
-        sum_ent = torch.zeros(self.model.d_hidden, device=self.device)
-        sum_non = torch.zeros(self.model.d_hidden, device=self.device)
-        count_ent = 0
-        count_non = 0
+
+        codes_list = []
+        labels_list = []
+
+        # ---- Collect representations ----
         with torch.no_grad():
-            iterator = tqdm(loader, desc="Finding entity dimension", disable=self.disable_progress)
+            iterator = tqdm(loader, desc="Collecting probe data", disable=self.disable_progress)
             for batch in iterator:
                 flattened = _flatten_tokens_with_labels(batch, self.device)
                 if flattened is None:
                     continue
-                tokens, labels = flattened
+                tokens, labels = flattened  # labels: boolean mask
                 out = self.model(tokens)
-                codes = out["codes"]
-                ent_mask = labels
-                non_mask = ~labels
-                if ent_mask.any():
-                    sum_ent += codes[ent_mask].sum(dim=0)
-                    count_ent += int(ent_mask.sum().item())
-                if non_mask.any():
-                    sum_non += codes[non_mask].sum(dim=0)
-                    count_non += int(non_mask.sum().item())
-        if count_ent == 0 or count_non == 0:
-            self.logger.warning("Unable to select entity dimension (missing entities or non-entities).")
+                codes = out["codes"]  # [num_tokens, d_hidden]
+
+                codes_list.append(codes)
+                labels_list.append(labels.float())
+
+        if len(codes_list) == 0:
+            self.logger.warning("No data for probe.")
             return None
-        mean_ent = sum_ent / max(1, count_ent)
-        mean_non = sum_non / max(1, count_non)
-        diff = mean_ent - mean_non
-        best_dim = int(torch.argmax(diff).item())
-        if not self.cfg.train.grid_mode:
-            self.logger.info(
-                "Selected entity dimension %d (mean_ent=%.6f mean_non=%.6f diff=%.6f)",
-                best_dim,
-                mean_ent[best_dim].item(),
-                mean_non[best_dim].item(),
-                diff[best_dim].item(),
-            )
-        return best_dim
+
+        X = torch.cat(codes_list, dim=0).to(self.device)      # [N, d_hidden]
+        y = torch.cat(labels_list, dim=0).to(self.device)      # [N]
+
+        if y.sum() == 0 or y.sum() == len(y):
+            self.logger.warning("Probe failed: dataset lacks entity/non-entity contrast.")
+            return None
+
+        d_hidden = X.size(-1)
+
+        # ---- Define logistic regression model ----
+        w = torch.zeros(d_hidden, device=self.device, requires_grad=True)
+        b = torch.zeros(1, device=self.device, requires_grad=True)
+
+        optimizer = torch.optim.Adam([w, b], lr=1e-2)
+
+        lambda_l1 = 1.0  # sparsity strength; tune if needed
+        batch_size = 4096
+        num_steps = 200
+
+        # ---- Train the sparse probe ----
+        for _ in range(num_steps):
+            idx = torch.randint(0, X.size(0), (batch_size,), device=self.device)
+            xb = X[idx]
+            yb = y[idx]
+
+            logits = xb @ w + b
+            preds = torch.sigmoid(logits)
+
+            bce = torch.nn.functional.binary_cross_entropy(preds, yb)
+            l1_penalty = lambda_l1 * w.abs().sum()
+
+            loss = bce + l1_penalty
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        return w.detach(), b.detach()
 
     def evaluate(self) -> Dict[str, float]:
-        best_dim = self._select_entity_dimension(self.eval_dl)
-        if best_dim is None:
-            return {"dimension": -1, "f1": 0.0, "precision": 0.0, "recall": 0.0}
+        """
+        Evaluate entity prediction using the full sparse logistic probe
+        (w, b) learned by _select_entity_dimension.
+        """
+        # 1. Train sparse probe on eval_dl
+        result = self._select_entity_dimension(self.eval_dl)
+        if result is None:
+            return {"f1": 0.0, "precision": 0.0, "recall": 0.0}
+
+        w, b = result  # each from _select_entity_dimension
+        w = w.to(self.device)
+        b = b.to(self.device)
+
+        # threshold for sigmoid output
         thresh = float(self.cfg.entity_eval.threshold)
-        self.model.eval()
+
         tp = fp = fn = 0
+        self.model.eval()
+
         with torch.no_grad():
-            iterator = tqdm(self.dev_dl, desc="Entity dim eval", disable=self.disable_progress)
+            iterator = tqdm(self.dev_dl, desc="Entity probe eval", disable=self.disable_progress)
             for batch in iterator:
                 flattened = _flatten_tokens_with_labels(batch, self.device)
                 if flattened is None:
                     continue
-                tokens, labels = flattened
-                codes = self.model(tokens)["codes"]
-                preds = (codes[:, best_dim] > thresh)
+                tokens, labels = flattened  # labels: bool mask
+
+                codes = self.model(tokens)["codes"]  # [num_tokens, d_hidden]
+                logits = codes @ w + b              # [num_tokens]
+                probs = torch.sigmoid(logits)
+                preds = probs > thresh
+
                 gold = labels
+
                 tp += int((preds & gold).sum().item())
                 fp += int((preds & ~gold).sum().item())
                 fn += int((~preds & gold).sum().item())
+
         f1, precision, recall = metrics_from_counts(tp, fp, fn)
-        return best_dim, f1 , precision, recall
+
+        return f1, precision, recall
 
     def train(self):
         best_f1 = 0.0
-        best_dim = -1
         for epoch in range(int(self.cfg.train.epochs)):
             loss, mse, l1 = self._train_epoch(epoch)
             if not self.cfg.train.grid_mode:
@@ -249,14 +295,12 @@ class SparseAETrainer:
                     self.cfg.train.epochs,
                     self._metrics_table({"loss": loss, "mse": mse, "l1": l1}),
                 )
-            dim, f1, precision, recall = self.evaluate()
+            f1, precision, recall = self.evaluate()
             if not self.cfg.train.grid_mode:
-                self.logger.info("Epoch %d dimension=%s", epoch + 1, dim)
                 self.logger.info("Epoch %d metrics:\n%s", epoch + 1, self._metrics_table({"f1": f1, "precision": precision, "recall": recall}))
             if f1 > best_f1:
                 best_f1 = f1
-                best_dim = dim
-                self.xp.link.push_metrics({"best_f1": best_f1, "best_dimension": best_dim, "best_epoch": epoch + 1})
+                self.xp.link.push_metrics({"best_f1": best_f1, "best_epoch": epoch + 1})
                 self.logger.info("Epoch %d metrics:\n%s", epoch + 1, self._metrics_table({"f1": f1, "precision": precision, "recall": recall}))
             self._save_checkpoint()
 
@@ -283,11 +327,7 @@ def main(cfg):
         trainer._load_checkpoint()
         metrics = trainer.evaluate(eval_dl, desc="SAE Eval")
         logger.info("Evaluation metrics:\n%s", trainer._metrics_table(metrics))
-        best_dim, f1, precision, recall = trainer.evaluate()
-        logger.info(
-            "Entity dimension=%s",
-            best_dim
-        )
+        f1, precision, recall = trainer.evaluate()
         logger.info("Entity metrics:\n%s", trainer._metrics_table({"f1": f1, "precision": precision, "recall": recall}))
     else:
         trainer.train()
